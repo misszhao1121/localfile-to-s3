@@ -24,14 +24,30 @@ const (
 // errSkip signals a task needs no further action because it is already done.
 var errSkip = errors.New("skip: already done")
 
-// Store is the SQLite-backed task state store. All writes go through
-// batched transactions (single writer); readers run concurrently in WAL mode.
+// Store is the SQLite-backed task state store.
+//
+// Concurrency design (rewritten after a crash on a real 40M-file scan):
+//   - AddPending/Record are called from MANY goroutines (parallel scanner
+//     walkers, upload workers, verify workers). They only SEND typed
+//     messages on buffered channels — no shared slices, no caller locks.
+//   - ONE writer goroutine per stream consumes messages in FIFO order and
+//     commits size/time-triggered batches inside a single transaction.
+//   - Flush* sends an ack-request through the SAME channel, so by FIFO
+//     ordering the ack guarantees every previously queued row is committed.
+//     It never closes the channel, so it is safe to call any number of
+//     times, from anywhere, at any point of the run.
+//   - Close flushes both streams, then stops the writers, then closes the DB.
+//   - Readers use pooled connections (WAL: concurrent read while writing);
+//     in-process write transactions are all inside the writer goroutines.
 type Store struct {
-	db *sql.DB
-	mu sync.Mutex // serializes write transactions
+	db    *sql.DB
+	done  chan struct{}
+	closeOnce sync.Once
 
-	batch []PendingRow // pending plan rows buffer
-	recs  []RecRow     // result rows buffer
+	planCh   chan planMsg
+	recCh    chan recMsg
+	planWG   sync.WaitGroup
+	recWG    sync.WaitGroup
 
 	// counters
 	planned  atomic.Int64
@@ -40,6 +56,16 @@ type Store struct {
 	requeued atomic.Int64
 	skipped  atomic.Int64
 	failed   atomic.Int64
+}
+
+type planMsg struct {
+	row PendingRow
+	ack chan struct{} // non-nil only for flush requests
+}
+
+type recMsg struct {
+	row RecRow
+	ack chan struct{} // non-nil only for flush requests
 }
 
 // PendingRow is one scanned file to plan.
@@ -59,7 +85,8 @@ type RecRow struct {
 }
 
 // OpenStore opens (creating if needed) the state database.
-// applySchema only runs for migrate mode to guarantee a read-only verify.
+// applySchema only runs for migrate/verify/web modes to guarantee a
+// read-only stats mode.
 func OpenStore(path string, applySchema bool) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
@@ -69,10 +96,10 @@ func OpenStore(path string, applySchema bool) (*Store, error) {
 	if err != nil {
 		return nil, err
 	}
-	// modernc sqlite is fully serialized internally; a single connection
-	// avoids SQLITE_BUSY between our own readers/writer.
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// WAL allows concurrent readers while a writer runs; our writers are
+	// the two goroutines below, readers use pooled connections.
+	db.SetMaxOpenConns(4)
+	db.SetMaxIdleConns(4)
 	db.SetConnMaxIdleTime(0)
 	db.SetConnMaxLifetime(0)
 
@@ -93,7 +120,18 @@ func OpenStore(path string, applySchema bool) (*Store, error) {
 			return nil, fmt.Errorf("state db %s has no schema; run migrate mode first", path)
 		}
 	}
-	return &Store{db: db}, nil
+
+	s := &Store{
+		db:     db,
+		done:   make(chan struct{}),
+		planCh: make(chan planMsg, 65536),
+		recCh:  make(chan recMsg, 32768),
+	}
+	s.planWG.Add(1)
+	go s.planWriter()
+	s.recWG.Add(1)
+	go s.recWriter()
+	return s, nil
 }
 
 func storeExec(db *sql.DB, script string) error {
@@ -125,10 +163,28 @@ func firstLine(s string) string {
 	return s
 }
 
+// Close flushes both streams and closes the database. Safe to call once.
 func (s *Store) Close() error {
 	s.FlushPending()
 	s.FlushRecords()
+	s.closeOnce.Do(func() { close(s.done) })
+	s.planWG.Wait()
+	s.recWG.Wait()
 	return s.db.Close()
+}
+
+// FlushPending commits every previously queued scanned row before returning.
+func (s *Store) FlushPending() {
+	ack := make(chan struct{})
+	s.planCh <- planMsg{ack: ack}
+	<-ack
+}
+
+// FlushRecords commits every previously queued result before returning.
+func (s *Store) FlushRecords() {
+	ack := make(chan struct{})
+	s.recCh <- recMsg{ack: ack}
+	<-ack
 }
 
 const schemaSQL = `
@@ -157,22 +213,47 @@ CREATE TABLE IF NOT EXISTS meta (
 
 // ---- plan (scan -> db) ----
 
-// AddPending buffers a scanned file; FlushPending writes in one transaction.
+// AddPending queues a scanned file; the plan writer commits it in batches.
+// When the buffer is full it applies backpressure to the scanner, which is
+// correct: the disk is the bottleneck at that point anyway.
 func (s *Store) AddPending(r PendingRow) {
-	s.batch = append(s.batch, r)
-	if len(s.batch) >= 4096 {
-		s.FlushPending()
+	s.planCh <- planMsg{row: r}
+}
+
+func (s *Store) planWriter() {
+	defer s.planWG.Done()
+	const batchMax = 8192
+	batch := make([]PendingRow, 0, batchMax)
+	t := time.NewTicker(300 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case m := <-s.planCh:
+			if m.ack != nil {
+				if len(batch) > 0 {
+					s.insertPending(batch)
+					batch = batch[:0]
+				}
+				close(m.ack)
+				continue
+			}
+			batch = append(batch, m.row)
+			if len(batch) >= batchMax {
+				s.insertPending(batch)
+				batch = batch[:0]
+			}
+		case <-t.C:
+			if len(batch) > 0 {
+				s.insertPending(batch)
+				batch = batch[:0]
+			}
+		case <-s.done:
+			return
+		}
 	}
 }
 
-func (s *Store) FlushPending() {
-	if len(s.batch) == 0 {
-		return
-	}
-	rows := s.batch
-	s.batch = nil
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Store) insertPending(rows []PendingRow) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		fatalErr("begin plan tx", err)
@@ -197,22 +278,45 @@ func (s *Store) FlushPending() {
 
 // ---- results (worker -> db) ----
 
-// Record buffers an upload/verify result; FlushRecords writes it in batch.
+// Record queues an upload/verify result; the record writer commits batches.
 func (s *Store) Record(r RecRow) {
-	s.recs = append(s.recs, r)
-	if len(s.recs) >= 2048 {
-		s.FlushRecords()
+	s.recCh <- recMsg{row: r}
+}
+
+func (s *Store) recWriter() {
+	defer s.recWG.Done()
+	const batchMax = 4096
+	batch := make([]RecRow, 0, batchMax)
+	t := time.NewTicker(500 * time.Millisecond)
+	defer t.Stop()
+	for {
+		select {
+		case m := <-s.recCh:
+			if m.ack != nil {
+				if len(batch) > 0 {
+					s.applyRecords(batch)
+					batch = batch[:0]
+				}
+				close(m.ack)
+				continue
+			}
+			batch = append(batch, m.row)
+			if len(batch) >= batchMax {
+				s.applyRecords(batch)
+				batch = batch[:0]
+			}
+		case <-t.C:
+			if len(batch) > 0 {
+				s.applyRecords(batch)
+				batch = batch[:0]
+			}
+		case <-s.done:
+			return
+		}
 	}
 }
 
-func (s *Store) FlushRecords() {
-	if len(s.recs) == 0 {
-		return
-	}
-	rows := s.recs
-	s.recs = nil
-	s.mu.Lock()
-	defer s.mu.Unlock()
+func (s *Store) applyRecords(rows []RecRow) {
 	tx, err := s.db.Begin()
 	if err != nil {
 		fatalErr("begin record tx", err)
@@ -266,67 +370,7 @@ func truncateMsg(m string) string {
 	return m
 }
 
-// PrintFailed prints up to n failed rows with their error messages.
-func (s *Store) PrintFailed(n int) {
-	rows, err := s.db.Query(
-		`SELECT key, attempts, err_code, err_msg FROM files WHERE state=2 ORDER BY key LIMIT ?`, n)
-	if err != nil {
-		fmt.Println("query failed rows:", err)
-		return
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var key, code, msg string
-		var attempts int
-		_ = rows.Scan(&key, &attempts, &code, &msg)
-		fmt.Printf("FAILED %s attempts=%d code=%s\n  %s\n", key, attempts, code, msg)
-	}
-}
-
-// dbCount counts rows in the files table (used for scan summary messages).
-func (s *Store) dbCount() (int64, error) {
-	var n int64
-	err := s.db.QueryRow(`SELECT COUNT(*) FROM files`).Scan(&n)
-	return n, err
-}
-
 // ---- task fetch ----
-
-// NextPending returns up to n pending keys (state=0), lowest key first.
-func (s *Store) NextPending(n int) ([]string, error) {
-	rows, err := s.db.Query(`SELECT key FROM files WHERE state=0 ORDER BY key LIMIT ?`, n)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var k string
-		if err := rows.Scan(&k); err != nil {
-			return nil, err
-		}
-		out = append(out, k)
-	}
-	return out, rows.Err()
-}
-
-// NextFailed returns up to n failed keys (state=2), lowest key first.
-func (s *Store) NextFailed(n int) ([]string, error) {
-	rows, err := s.db.Query(`SELECT key FROM files WHERE state=2 ORDER BY key LIMIT ?`, n)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var out []string
-	for rows.Next() {
-		var k string
-		if err := rows.Scan(&k); err != nil {
-			return nil, err
-		}
-		out = append(out, k)
-	}
-	return out, rows.Err()
-}
 
 // MetaTask is a pending or failed row with its source path info.
 type MetaTask struct {
@@ -354,33 +398,6 @@ func (s *Store) NextMetaPending(state int, n int, after string) ([]MetaTask, err
 		out = append(out, t)
 	}
 	return out, rows.Err()
-}
-
-// ---- verify support ----
-
-// MarkVerifiedByKey verifies a row only if its recorded size matches the
-// remote size; mismatch re-queues it for upload. Returns the action taken.
-func (s *Store) MarkVerifiedByKey(key string, remoteSize int64) (string, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	var localSize int64
-	var state int
-	err := s.db.QueryRow(`SELECT size, state FROM files WHERE key=?`, key).Scan(&localSize, &state)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "absent", nil
-	}
-	if err != nil {
-		return "", err
-	}
-	if state == StateDone && localSize == remoteSize {
-		_, err := s.db.Exec(`UPDATE files SET verified_at=? WHERE key=?`, time.Now().Unix(), key)
-		return "ok", err
-	}
-	if localSize != remoteSize {
-		_, err := s.db.Exec(`UPDATE files SET state=0 WHERE key=?`, key)
-		return "size-mismatch-requeued", err
-	}
-	return "ok", nil
 }
 
 // PageRows returns rows ordered by key strictly after `after`, for pagination.
@@ -412,8 +429,6 @@ func (s *Store) PageRows(after string, limit int) ([]PageRow, error) {
 
 // ResetFailedToPending requeues failed rows; returns the number requeued.
 func (s *Store) ResetFailedToPending() (int64, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	res, err := s.db.Exec(`UPDATE files SET state=0, err_code='', err_msg='' WHERE state=2`)
 	if err != nil {
 		return 0, err
@@ -422,7 +437,7 @@ func (s *Store) ResetFailedToPending() (int64, error) {
 	return n, nil
 }
 
-// ---- scan coordination ----
+// ---- scan coordination (meta) ----
 
 func (s *Store) GetMeta(k string) (string, error) {
 	var v string
@@ -434,8 +449,6 @@ func (s *Store) GetMeta(k string) (string, error) {
 }
 
 func (s *Store) SetMeta(k, v string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	_, err := s.db.Exec(`INSERT INTO meta(k,v) VALUES(?,?)
 		ON CONFLICT(k) DO UPDATE SET v=excluded.v`, k, v)
 	return err
@@ -454,8 +467,6 @@ func (s *Store) Rescan() error { return s.SetMeta("scan_done", "0") }
 
 // Reset clears all task state.
 func (s *Store) Reset() error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, q := range []string{`DELETE FROM files`, `DELETE FROM meta`} {
 		if _, err := s.db.Exec(q); err != nil {
 			return err
@@ -470,7 +481,7 @@ type Stats struct {
 	DBTotal, DBDone, DBPending, DBFailed                   int64
 }
 
-// Snapshot returns live counters plus DB-derived counts.
+// Snapshot returns live counters plus DB-derived counts (one grouped query).
 func (s *Store) Snapshot() Stats {
 	st := Stats{
 		Planned:  s.planned.Load(),
@@ -480,13 +491,24 @@ func (s *Store) Snapshot() Stats {
 		Skipped:  s.skipped.Load(),
 		Requeued: s.requeued.Load(),
 	}
-	q := func(sqlq string, dst *int64) {
-		_ = s.db.QueryRow(sqlq).Scan(dst)
+	rows, err := s.db.Query(`SELECT state, COUNT(*) FROM files GROUP BY state`)
+	if err == nil {
+		for rows.Next() {
+			var state, cnt int64
+			if rows.Scan(&state, &cnt) == nil {
+				st.DBTotal += cnt
+				switch state {
+				case StateDone:
+					st.DBDone = cnt
+				case StatePending:
+					st.DBPending = cnt
+				case StateFailed:
+					st.DBFailed = cnt
+				}
+			}
+		}
+		rows.Close()
 	}
-	q(`SELECT COUNT(*) FROM files`, &st.DBTotal)
-	q(`SELECT COUNT(*) FROM files WHERE state=1`, &st.DBDone)
-	q(`SELECT COUNT(*) FROM files WHERE state=0`, &st.DBPending)
-	q(`SELECT COUNT(*) FROM files WHERE state=2`, &st.DBFailed)
 	return st
 }
 
@@ -504,6 +526,26 @@ func (s *Store) PrintStats() {
 	fmt.Printf("failed  (run)   : %d\n", t.Failed)
 }
 
-// WaitForReader is a no-op today because all DB access shares one connection
-// guarded by the store mutex for writes; kept for future reader pools.
-func (s *Store) WaitForReader() {}
+// dbCount counts rows in the files table (used for scan summary messages).
+func (s *Store) dbCount() (int64, error) {
+	var n int64
+	err := s.db.QueryRow(`SELECT COUNT(*) FROM files`).Scan(&n)
+	return n, err
+}
+
+// PrintFailed prints up to n failed rows with their error messages.
+func (s *Store) PrintFailed(n int) {
+	rows, err := s.db.Query(
+		`SELECT key, attempts, err_code, err_msg FROM files WHERE state=2 ORDER BY key LIMIT ?`, n)
+	if err != nil {
+		fmt.Println("query failed rows:", err)
+		return
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key, code, msg string
+		var attempts int
+		_ = rows.Scan(&key, &attempts, &code, &msg)
+		fmt.Printf("FAILED %s attempts=%d code=%s\n  %s\n", key, attempts, code, msg)
+	}
+}

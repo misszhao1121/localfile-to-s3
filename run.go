@@ -146,8 +146,20 @@ verifyLoop:
 				key := pre + r.Key
 				exists, size, err := headExists(ctx, cli, cfg.Bucket, key)
 				if err != nil {
-					prog.failed.Add(1)
-					return
+					// transient HEAD failure: count and retry this row once
+					// more before giving up (mock/single-node servers under
+					// 64-way HEAD pressure drop keep-alive connections).
+					select {
+					case <-ctx.Done():
+						prog.failed.Add(1)
+						return
+					case <-time.After(200 * time.Millisecond):
+					}
+					exists, size, err = headExists(ctx, cli, cfg.Bucket, key)
+					if err != nil {
+						prog.failed.Add(1)
+						return
+					}
 				}
 				if !exists {
 					// missing remotely: requeue for upload
