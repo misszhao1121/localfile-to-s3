@@ -1,6 +1,6 @@
 # rustfs-migrate
 
-把本地 MinIO 桶目录（如 `/data/minio/dev-industai-app`）中的**普通文件**批量迁移到
+把本地 MinIO 桶目录（如 `/data/minio/test`）中的**普通文件**批量迁移到
 S3 兼容集群（RustFS）的对象存储中。专为 **数千万级小文件** 设计（已在 4000 万规模
 下设计并验证核心路径）。
 
@@ -101,7 +101,7 @@ HEAD 并修正账本，缺失的重新入队。
    否则拒绝启动（防止状态库误写进源树）。
 3. **运行层**：迁移启动时主动探测源目录是否拒绝写入（尝试创建探针文件），
    若源目录可写则打印 WARNING，建议运维侧挂载只读：
-   `mount -o bind,ro /data/minio/dev-industai-app /data/minio/dev-industai-app`
+   `mount -o bind,ro /data/minio/test /data/minio/test`
    或对目录 `chmod a-w`。**即使源目录未只读挂载，本工具自身也绝不写入源目录。**
 
 迁移期间的源变化处理：
@@ -116,7 +116,7 @@ HEAD 并修正账本，缺失的重新入队。
 
 ```bash
 # 0. 运维兜底：迁移窗口内将源目录挂载/授权为只读（工具自身也绝不写源）
-mount -o bind,ro /data/minio/dev-industai-app /data/minio/dev-industai-app
+mount -o bind,ro /data/minio/test /data/minio/test
 
 # 1. 预演：先在低峰期小并发试跑，观察 RustFS 集群负载
 #    将 workers 从 64 逐步上调至 128~256
