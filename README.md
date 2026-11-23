@@ -15,6 +15,7 @@ S3 兼容集群（RustFS）的对象存储中。专为 **数千万级小文件**
 | 可中断扫描 | 目录扫描本身可恢复（`scan_done` 标记）；`--rescan` 可重扫增量 |
 | 双层重试 | SDK 内置重试 + 应用层指数退避重试（可配），503/SlowDown/网络错误自动处理 |
 | 首次自动比对 | `dedup_head` 默认开启：PUT 前先 HEAD，已存在且大小一致的对象直接跳过，适合接手"已传了一部分"的桶 |
+| Web 控制台 | `web` 模式内置网页：配置编辑（密钥掩码）、启动/停止、实时进度、日志查看 |
 | HEAD 校验 | `verify` 模式用 HeadObject 与本地账本对账：缺失/大小不符的自动重新入队 |
 | 并发控制 | worker 池 + 每主机连接池上限，避免压垮 5 节点集群 |
 | 前缀乱序 | 批内按 key 首段目录分组轮转，避免多目录流在同块磁盘上交叉寻道 |
@@ -90,6 +91,25 @@ HEAD 并修正账本，缺失的重新入队。
 - HEAD 失败（网络抖动等）不会阻断迁移：该文件照常走 PUT 覆盖写，
   保证最终一致（覆盖写同 key 同内容无副作用）。
 
+## Web 控制台
+
+```bash
+./rustfs-migrate -c config.conf web          # 默认监听 :8080
+RUSTFS_MIGRATE_WEB_ADDR=:9001 ./rustfs-migrate -c config.conf web   # 自定义端口
+```
+
+浏览器打开 `http://<机器IP>:8080`：
+
+- **迁移进度**：进度条 + done/pending/failed 计数 + 本次速率（3 秒刷新）
+- **操作**：启动迁移 / 全量对账 / 重试失败项 / 优雅停止（同一时间只跑一个任务）
+- **运行日志**：实时日志尾部（自动滚动）
+- **配置编辑**：网页表单编辑 config.conf，保存时自动校验；
+  `access_key` / `secret_key` 掩码显示——留空即保持原值，输入新值即替换，
+  **密钥永远不会回显到页面**
+
+安全提示：web 端口无认证，务必只在内网/可信环境开放，
+或用 `RUSTFS_MIGRATE_WEB_ADDR=127.0.0.1:8080` 仅绑定本机。
+
 ## 源目录只读（兜底策略）
 
 程序对源目录的访问被约束为**严格只读**，由三层机制保证：
@@ -159,6 +179,10 @@ scan.go        并发目录扫描（限深、可恢复；仅 readdir）
 sourcefs.go    源只读守卫：O_RDONLY 唯一打开点、路径包含校验、只读探测
 uploader.go    S3 客户端、上传 worker 池、重试退避、HEAD 校验
 run.go         migrate/verify/retry 编排
+web.go         web 模式：HTTP 服务、任务管理器（单任务槽）
+webapi.go      web JSON API：status/stats/config/job/log
+webstatic.go   内嵌 UI 资源
+web/index.html 单文件控制台页面
 log.go         进度条与日志
 mode.go        子命令常量
 inode_*.go     平台相关 inode 读取（仅诊断用）

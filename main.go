@@ -71,6 +71,8 @@ func run() error {
 			mode = ModeStats
 		case string(ModeReset):
 			mode = ModeReset
+		case string(ModeWeb):
+			mode = ModeWeb
 		default:
 			cfgPath = positional[0]
 		}
@@ -90,7 +92,7 @@ func run() error {
 		return err
 	}
 
-	st, err := OpenStore(cfg.DBPath(), mode == ModeMigrate || mode == ModeVerify)
+	st, err := OpenStore(cfg.DBPath(), mode == ModeMigrate || mode == ModeVerify || mode == ModeWeb)
 	if err != nil {
 		return fmt.Errorf("open state db %s: %w", cfg.DBPath(), err)
 	}
@@ -121,6 +123,9 @@ func run() error {
 		return nil
 	case ModeReset:
 		return st.Reset()
+	case ModeWeb:
+		st.Close() // web manages its own store per job
+		return runWeb(cfg, cfgPath)
 	}
 	return nil
 }
@@ -134,6 +139,7 @@ Usage:
 
 Modes:
   (default)          plan + upload
+  web                web UI: config editor, start/stop, live progress (port 8080)
   verify             reconcile local state with HeadObject on the cluster
   retry              re-attempt failed keys
   stats              print counts
@@ -143,6 +149,7 @@ Examples:
   rustfs-migrate -c /etc/rustfs-migrate/config.conf
   rustfs-migrate -c config.conf verify
   rustfs-migrate -c config.conf retry
+  rustfs-migrate -c config.conf web
 
 During the run: Ctrl-C drains in-flight uploads and saves state; press twice to force stop.
 `)

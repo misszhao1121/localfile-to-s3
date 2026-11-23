@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>rustfs-migrate 控制台</title>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--fg:#e2e8f0;--mut:#94a3b8;--ok:#4ade80;--warn:#fbbf24;--err:#f87171;--acc:#38bdf8;--bd:#334155}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,"Segoe UI",Roboto,"Microsoft YaHei",sans-serif}
+.wrap{max-width:1080px;margin:0 auto;padding:20px}
+h1{font-size:20px;margin:0 0 4px} .sub{color:var(--mut);font-size:12px;margin-bottom:18px}
+.card{background:var(--card);border:1px solid var(--bd);border-radius:10px;padding:16px;margin-bottom:16px}
+.card h2{font-size:15px;margin:0 0 12px;color:var(--acc)}
+.row{display:flex;gap:16px;flex-wrap:wrap}
+.stat{flex:1;min-width:120px;background:var(--bg);border:1px solid var(--bd);border-radius:8px;padding:10px 12px}
+.stat .n{font-size:22px;font-weight:600} .stat .l{color:var(--mut);font-size:12px}
+.bar{height:14px;background:var(--bg);border:1px solid var(--bd);border-radius:7px;overflow:hidden;margin:8px 0}
+.bar>i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--ok));width:0;transition:width .6s}
+button{background:var(--acc);color:#04121f;border:0;border-radius:8px;padding:8px 16px;font-weight:600;cursor:pointer;margin-right:8px}
+button.warn{background:var(--warn)} button.err{background:var(--err)} button:disabled{opacity:.4;cursor:not-allowed}
+table{width:100%;border-collapse:collapse;font-size:13px}
+td{padding:4px 6px;border-top:1px solid var(--bd)}
+td.k{color:var(--mut);width:180px}
+input,textarea{width:100%;background:var(--bg);color:var(--fg);border:1px solid var(--bd);border-radius:6px;padding:6px 8px;font:inherit}
+textarea{min-height:120px;resize:vertical;font-family:ui-monospace,Consolas,monospace}
+#log{background:#020617;border:1px solid var(--bd);border-radius:8px;padding:10px;height:260px;overflow:auto;font:12px ui-monospace,Consolas,monospace;white-space:pre-wrap;word-break:break-all}
+.badge{display:inline-block;padding:2px 10px;border-radius:10px;font-size:12px;font-weight:600}
+.b-idle{background:#334155}.b-running{background:var(--acc);color:#04121f}.b-done{background:var(--ok);color:#04121f}.b-failed{background:var(--err);color:#1f0000}.b-canceled{background:var(--warn);color:#1f1500}
+.msg{font-size:12px;color:var(--mut);margin-top:6px;min-height:16px}
+.err-msg{color:var(--err)}
+#cfgErr{color:var(--err)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>rustfs-migrate 控制台</h1>
+  <div class="sub">本地 MinIO 桶目录 → RustFS 迁移 &nbsp;|&nbsp; 源目录严格只读</div>
+
+  <div class="card">
+    <h2>迁移进度 <span id="jobBadge" class="badge b-idle">idle</span></h2>
+    <div class="bar"><i id="barFill"></i></div>
+    <div class="row">
+      <div class="stat"><div class="n" id="sTotal">-</div><div class="l">总文件 (账本)</div></div>
+      <div class="stat"><div class="n" id="sDone">-</div><div class="l">已完成</div></div>
+      <div class="stat"><div class="n" id="sPend">-</div><div class="l">待上传</div></div>
+      <div class="stat"><div class="n" id="sFail">-</div><div class="l">失败</div></div>
+      <div class="stat"><div class="n" id="sRate">-</div><div class="l">本次速率 obj/s</div></div>
+      <div class="stat"><div class="n" id="sUp">-</div><div class="l">本次已传</div></div>
+      <div class="stat"><div class="n" id="sSkip">-</div><div class="l">本次比对跳过</div></div>
+    </div>
+    <div class="msg" id="jobErr"></div>
+  </div>
+
+  <div class="card">
+    <h2>操作</h2>
+    <button id="btnStart" onclick="startJob('migrate')">▶ 启动迁移</button>
+    <button onclick="startJob('verify')">⧉ 全量对账 (verify)</button>
+    <button onclick="startJob('retry')">↻ 重试失败项</button>
+    <button id="btnStop" class="err" onclick="stopJob()">■ 停止 (优雅排空)</button>
+    <div class="msg">停止等同 Ctrl-C：在途请求排空后落盘退出，可随时重启续传。</div>
+  </div>
+
+  <div class="card">
+    <h2>运行日志（尾部 64KB）</h2>
+    <div id="log">...</div>
+  </div>
+
+  <div class="card">
+    <h2>配置编辑 <span style="font-size:12px;color:var(--mut)">（access_key / secret_key 掩码显示，留空=不改）</span></h2>
+    <table id="cfgTable"></table>
+    <div style="margin-top:10px">
+      <button onclick="saveConfig()">💾 保存配置</button>
+      <span class="msg" id="cfgMsg" style="display:inline-block"></span>
+    </div>
+    <div class="msg" id="cfgErr"></div>
+  </div>
+</div>
+
+<script>
+let cfgLines = [];
+let prevJob = null;
+
+const $ = id => document.getElementById(id);
+function fmt(n){ return n==null ? '-' : Number(n).toLocaleString(); }
+
+async function refresh(){
+  try{
+    const st = await (await fetch('/api/status')).json();
+    renderStatus(st);
+  }catch(e){ $('jobErr').textContent = 'API 不可达: '+e; }
+  try{
+    const lg = await (await fetch('/api/log')).json();
+    const el = $('log');
+    const atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+    el.textContent = lg.log || '';
+    if(atBottom) el.scrollTop = el.scrollHeight;
+  }catch(e){}
+}
+
+function renderStatus(st){
+  // job badge
+  const j = st.job || {state:'idle'};
+  const badge = $('jobBadge');
+  badge.textContent = j.state;
+  badge.className = 'badge b-'+j.state;
+  const running = j.state === 'running';
+  $('btnStart').disabled = running;
+  document.querySelectorAll('button[onclick^="startJob"]').forEach(b=>b.disabled = running);
+  $('btnStop').disabled = !running;
+  $('jobErr').textContent = j.error ? ('错误: '+j.error) : '';
+  if(j.error) $('jobErr').classList.add('err-msg');
+
+  // stats
+  const s = st.stats;
+  if(s){
+    $('sTotal').textContent = fmt(s.db_total);
+    $('sDone').textContent  = fmt(s.db_done);
+    $('sPend').textContent  = fmt(s.db_pending);
+    $('sFail').textContent  = fmt(s.db_failed);
+    $('sUp').textContent    = fmt(s.uploaded);
+    $('sSkip').textContent  = fmt(s.skipped);
+    const denom = s.db_total>0 ? s.db_total : 0;
+    const doneAll = s.db_done + s.skipped;
+    const pct = denom>0 ? Math.min(100, doneAll/denom*100) : 0;
+    $('barFill').style.width = pct.toFixed(1)+'%';
+    // rate from uploaded delta between polls
+    const now = Date.now();
+    if(prevJob && prevJob.t && s.uploaded >= prevJob.up){
+      const dt = (now - prevJob.t)/1000;
+      if(dt > 0) $('sRate').textContent = fmt(Math.round((s.uploaded - prevJob.up)/dt));
+    }
+    prevJob = {t: now, up: s.uploaded};
+  }
+  // config health
+  $('cfgErr').textContent = st.config_err ? ('配置校验失败: '+st.config_err) : '';
+}
+
+// ---- config editor ----
+async function loadConfig(){
+  cfgLines = await (await fetch('/api/config')).json();
+  const tb = $('cfgTable');
+  tb.innerHTML = '';
+  for(const ln of cfgLines){
+    const tr = document.createElement('tr');
+    if(!ln.key){
+      const td = document.createElement('td');
+      td.colSpan = 2;
+      td.style.color = 'var(--mut)';
+      td.style.fontSize = '12px';
+      td.textContent = ln.comment || '';
+      tr.appendChild(td);
+    } else {
+      tr.innerHTML = `<td class="k">${ln.key}</td>`;
+      const tdv = document.createElement('td');
+      const inp = document.createElement('input');
+      inp.value = ln.value;
+      inp.dataset.key = ln.key;
+      if(ln.masked){ inp.type='password'; inp.placeholder='留空 = 不修改'; inp.value=''; }
+      inp.oninput = () => { ln.value = inp.value; if(ln.masked && inp.value===''){ ln.value='\u0000MASKED\u0000'; } };
+      tdv.appendChild(inp);
+      tr.appendChild(tdv);
+    }
+    tb.appendChild(tr);
+  }
+}
+
+async function saveConfig(){
+  $('cfgMsg').textContent = '保存中...';
+  // serialize: keep comments in order
+  const payload = {lines: cfgLines.map(ln => ln.key ? {key:ln.key, value:ln.value} : {key:'', value:'', comment: ln.comment || ''})};
+  const res = await fetch('/api/config', {method:'POST', body: JSON.stringify(payload), headers:{'Content-Type':'application/json'}});
+  const body = await res.json();
+  if(res.ok){
+    $('cfgMsg').textContent = '已保存 ✓'; 
+    if(body.error) $('cfgMsg').textContent = '已保存，但校验失败: '+body.error;
+    loadConfig();
+  } else {
+    $('cfgMsg').textContent = '';
+    $('cfgErr').textContent = body.error || res.statusText;
+  }
+}
+
+// ---- job control ----
+async function startJob(kind){
+  const res = await fetch('/api/job/'+kind, {method:'POST'});
+  if(!res.ok){ const b = await res.json(); $('jobErr').textContent = b.error || res.statusText; return; }
+  refresh();
+}
+async function stopJob(){
+  await fetch('/api/job/stop', {method:'POST'});
+  refresh();
+}
+
+loadConfig();
+refresh();
+setInterval(refresh, 3000);
+</script>
+</body>
+</html>

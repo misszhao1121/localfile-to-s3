@@ -9,4 +9,5 @@ const (
 	ModeRetry   Mode = "retry"
 	ModeStats   Mode = "stats"
 	ModeReset   Mode = "reset"
+	ModeWeb     Mode = "web"
 )
