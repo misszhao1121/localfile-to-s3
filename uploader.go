@@ -208,8 +208,9 @@ func uploadOne(ctx context.Context, cli *s3.Client, cfg *Config, pool *sync.Pool
 	if cfg.DedupHead {
 		exists, size, err := headExists(ctx, cli, cfg.Bucket, t.Key)
 		if err != nil {
-			// HEAD failure must not block the upload: fall through to PUT
-			logErrf("dedup head failed for %s (will upload anyway): %v\n", t.Key, err)
+			// HEAD failure must not block the upload: count and fall
+			// through to PUT (overwrite of same content is harmless).
+			prog.headErr.Add(1)
 		} else if exists && size == t.Size {
 			return false, true, nil
 		}
@@ -224,6 +225,10 @@ func uploadOne(ctx context.Context, cli *s3.Client, cfg *Config, pool *sync.Pool
 		}
 		done, err := putOnce(ctx, cli, cfg, pool, prog, t)
 		if err == nil {
+			if attempt > 0 {
+				// succeeded after retry(s): count server-pressure events
+				prog.retried.Add(int64(attempt))
+			}
 			return done, false, nil
 		}
 		if errors.Is(err, errSkip) {
@@ -232,6 +237,7 @@ func uploadOne(ctx context.Context, cli *s3.Client, cfg *Config, pool *sync.Pool
 		if !retryable(err) {
 			return false, false, err
 		}
+		prog.retried.Add(1)
 		lastErr = err
 	}
 	return false, false, lastErr

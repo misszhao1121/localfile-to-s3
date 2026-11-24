@@ -74,6 +74,8 @@ type Progress struct {
 	scanned   atomic.Int64
 	inFlight  atomic.Int64
 	totalHint atomic.Int64
+	retried   atomic.Int64 // retry events absorbed (503/SlowDown/net errors)
+	headErr   atomic.Int64 // dedup-HEAD failures (upload proceeded anyway)
 }
 
 func NewProgress() *Progress {
@@ -138,10 +140,10 @@ func (p *Progress) render(forceNL bool) {
 		done = up + boot
 	}
 
-	line := fmt.Sprintf("[%s] scanned=%s uploaded=%s verified=%s resumed-done=%s failed=%s inflight=%d rate=%.0f obj/s %.1f MB/s",
+	line := fmt.Sprintf("[%s] scanned=%s uploaded=%s verified=%s resumed-done=%s failed=%s inflight=%d retry=%s rate=%.0f obj/s %.1f MB/s",
 		elapsed,
 		comma(sc), comma(up), comma(vf), comma(boot), comma(fail),
-		inF, rate, bps/1024/1024)
+		inF, comma(p.retried.Load()), rate, bps/1024/1024)
 	if total > 0 {
 		pct := float64(done) / float64(total) * 100
 		line += fmt.Sprintf(" progress=%.1f%% (%s/%s)", pct, comma(done), comma(total))

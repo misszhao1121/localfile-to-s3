@@ -6,7 +6,7 @@ import re
 
 BUCKET = "dev-industai-app"
 OBJECTS = {}
-FAIL_FIRST = {"n": 15}  # fail the first 15 object PUTs with 503
+FAIL_EVERY = {"n": 0, "every": 0}  # fail every Nth PUT with 503 when every>0
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -54,10 +54,11 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", "0")
             self.end_headers()
             return
-        if FAIL_FIRST["n"] > 0:
-            FAIL_FIRST["n"] -= 1
-            self._empty(503)
-            return
+        if FAIL_EVERY["every"] > 0:
+            FAIL_EVERY["n"] += 1
+            if FAIL_EVERY["n"] % FAIL_EVERY["every"] == 0:
+                self._empty(503)
+                return
         OBJECTS[key] = body
         self.send_response(200)
         self.send_header("ETag", '"mock"')
@@ -79,6 +80,8 @@ class Handler(BaseHTTPRequestHandler):
 
 if __name__ == "__main__":
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 9333
+    every = int(sys.argv[2]) if len(sys.argv) > 2 else 0
+    FAIL_EVERY["every"] = every
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"mock s3 (fail-first={FAIL_FIRST['n']}) listening on {port}", flush=True)
+    print(f"mock s3 (503 every {every}th PUT) listening on {port}", flush=True)
     srv.serve_forever()
