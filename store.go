@@ -91,7 +91,7 @@ func OpenStore(path string, applySchema bool) (*Store, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return nil, err
 	}
-	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(10000)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(64)&_pragma=mmap_size(268435456)&_pragma=cache_size(-262144)&_pragma=foreign_keys(OFF)"
+	dsn := "file:" + path + "?_pragma=journal_mode(WAL)&_pragma=busy_timeout(30000)&_pragma=synchronous(NORMAL)&_pragma=wal_autocheckpoint(64)&_pragma=mmap_size(268435456)&_pragma=cache_size(-262144)&_pragma=foreign_keys(OFF)&_txlock=immediate"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, err
@@ -253,26 +253,56 @@ func (s *Store) planWriter() {
 	}
 }
 
-func (s *Store) insertPending(rows []PendingRow) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		fatalErr("begin plan tx", err)
-	}
-	stmt, err := tx.Prepare(`INSERT INTO files (key, rel, size, mtime_ns, ino, state) VALUES (?,?,?,?,?,0)
-		ON CONFLICT(key) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns, ino=excluded.ino,
-		state=CASE WHEN files.state=1 THEN 1 ELSE files.state END`)
-	if err != nil {
-		fatalErr("prepare plan stmt", err)
-	}
-	for _, r := range rows {
-		if _, err := stmt.Exec(r.Rel, r.Rel, r.Sz, r.Mod, int64(r.Ino)); err != nil {
-			fatalErr("exec plan stmt", err)
+// writeTx runs fn inside one IMMEDIATE transaction with retry on SQLITE_BUSY.
+// _txlock=immediate in the DSN makes Begin take the write lock up front, so
+// busy_timeout actually queues instead of failing fast on lock upgrades.
+// Writers never os.Exit on transient DB errors: they retry, then report.
+func (s *Store) writeTx(what string, fn func(tx *sql.Tx) error) {
+	const maxAttempts = 5
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(time.Duration(100*(1<<attempt)) * time.Millisecond) // 200ms..3.2s
 		}
+		tx, err := s.db.Begin()
+		if err != nil {
+			lastErr = err
+			logErrf("db %s begin attempt %d failed: %v\n", what, attempt+1, err)
+			continue
+		}
+		if err := fn(tx); err != nil {
+			tx.Rollback()
+			lastErr = err
+			logErrf("db %s tx attempt %d failed: %v\n", what, attempt+1, err)
+			continue
+		}
+		if err := tx.Commit(); err != nil {
+			lastErr = err
+			logErrf("db %s commit attempt %d failed: %v\n", what, attempt+1, err)
+			continue
+		}
+		return // success
 	}
-	stmt.Close()
-	if err := tx.Commit(); err != nil {
-		fatalErr("commit plan tx", err)
-	}
+	// persistent DB failure: stop the process with a clear reason
+	fatalErr("db writes failed repeatedly ("+what+")", lastErr)
+}
+
+func (s *Store) insertPending(rows []PendingRow) {
+	s.writeTx("plan", func(tx *sql.Tx) error {
+		stmt, err := tx.Prepare(`INSERT INTO files (key, rel, size, mtime_ns, ino, state) VALUES (?,?,?,?,?,0)
+			ON CONFLICT(key) DO UPDATE SET size=excluded.size, mtime_ns=excluded.mtime_ns, ino=excluded.ino,
+			state=CASE WHEN files.state=1 THEN 1 ELSE files.state END`)
+		if err != nil {
+			return err
+		}
+		defer stmt.Close()
+		for _, r := range rows {
+			if _, err := stmt.Exec(r.Rel, r.Rel, r.Sz, r.Mod, int64(r.Ino)); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
 	s.planned.Add(int64(len(rows)))
 }
 
@@ -317,39 +347,35 @@ func (s *Store) recWriter() {
 }
 
 func (s *Store) applyRecords(rows []RecRow) {
-	tx, err := s.db.Begin()
-	if err != nil {
-		fatalErr("begin record tx", err)
-	}
-	stmt, err := tx.Prepare(`UPDATE files SET
-		state=?,
-		uploaded_at=CASE WHEN ?=1 THEN ? ELSE uploaded_at END,
-		verified_at=CASE WHEN ?=1 THEN ? ELSE verified_at END,
-		attempts=attempts+1,
-		err_code=CASE WHEN ?=1 THEN '' ELSE ? END,
-		err_msg=CASE WHEN ?=1 THEN '' ELSE ? END
-		WHERE key=? AND state<>?`)
-	if err != nil {
-		fatalErr("prepare record stmt", err)
-	}
-	now := time.Now().Unix()
-	for _, r := range rows {
-		// r.State: 1=done, 2=failed, 0=requeue(pending)
-		code, msg := "", ""
-		if r.State != 1 {
-			code, msg = r.Code, truncateMsg(r.Msg)
+	s.writeTx("record", func(tx *sql.Tx) error {
+		stmt, err := tx.Prepare(`UPDATE files SET
+			state=?,
+			uploaded_at=CASE WHEN ?=1 THEN ? ELSE uploaded_at END,
+			verified_at=CASE WHEN ?=1 THEN ? ELSE verified_at END,
+			attempts=attempts+1,
+			err_code=CASE WHEN ?=1 THEN '' ELSE ? END,
+			err_msg=CASE WHEN ?=1 THEN '' ELSE ? END
+			WHERE key=? AND state<>?`)
+		if err != nil {
+			return err
 		}
-		if _, err := stmt.Exec(
-			r.State, r.State, now, r.State, now,
-			r.State, code, r.State, msg, r.Key, r.State,
-		); err != nil {
-			fatalErr("exec record stmt", err)
+		defer stmt.Close()
+		now := time.Now().Unix()
+		for _, r := range rows {
+			// r.State: 1=done, 2=failed, 0=requeue(pending)
+			code, msg := "", ""
+			if r.State != 1 {
+				code, msg = r.Code, truncateMsg(r.Msg)
+			}
+			if _, err := stmt.Exec(
+				r.State, r.State, now, r.State, now,
+				r.State, code, r.State, msg, r.Key, r.State,
+			); err != nil {
+				return err
+			}
 		}
-	}
-	stmt.Close()
-	if err := tx.Commit(); err != nil {
-		fatalErr("commit record tx", err)
-	}
+		return nil
+	})
 	for _, r := range rows {
 		switch r.State {
 		case 1:

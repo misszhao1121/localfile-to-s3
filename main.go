@@ -19,12 +19,27 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"syscall"
 )
 
 var errSilent = errors.New("silent")
 
 func main() {
+	// Route panics to both stderr and the configured log file: the top
+	// panic line (the actual reason) must survive in nohup.out tail.
+	defer func() {
+		if r := recover(); r != nil {
+			buf := make([]byte, 64*1024)
+			n := runtime.Stack(buf, true)
+			msg := fmt.Sprintf("PANIC: %v\n%s", r, buf[:n])
+			fmt.Fprint(os.Stderr, msg)
+			if logFile != nil {
+				fmt.Fprint(logFile, msg)
+			}
+			os.Exit(3)
+		}
+	}()
 	if err := run(); err != nil {
 		if err == errSilent {
 			os.Exit(1)
