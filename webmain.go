@@ -12,7 +12,7 @@ func runWeb(cfg *Config, cfgPath string) error {
 		addr = ":8080"
 	}
 	ws := newWebServer(cfgPath)
-	logf(os.Stdout, "rustfs-migrate web UI\n")
+	logf(os.Stdout, "rustfs-migrate web UI (build %s)\n", buildVersion)
 	logf(os.Stdout, "config : %s\n", cfgPath)
 	logf(os.Stdout, "source : %s\n", cfg.SourceRoot)
 	return ws.serve(addr)

@@ -25,6 +25,11 @@ import (
 
 var errSilent = errors.New("silent")
 
+// buildVersion is overridden at build time via:
+//   -ldflags "-X main.buildVersion=<ver>"
+// so deployed binaries can be told apart.
+var buildVersion = "1.3.0"
+
 func main() {
 	// Route panics to both stderr and the configured log file: the top
 	// panic line (the actual reason) must survive in nohup.out tail.
@@ -60,7 +65,7 @@ func run() error {
 			usage()
 			return nil
 		case "-v", "--version":
-			fmt.Println("rustfs-migrate 1.2.0")
+			fmt.Println("rustfs-migrate", buildVersion)
 			return nil
 		case "-c", "--config":
 			if i+1 >= len(args) {
