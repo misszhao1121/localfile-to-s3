@@ -76,6 +76,7 @@ type Progress struct {
 	totalHint atomic.Int64
 	retried   atomic.Int64 // retry events absorbed (503/SlowDown/net errors)
 	headErr   atomic.Int64 // dedup-HEAD failures (upload proceeded anyway)
+	lim       limiterView  // adaptive in-flight cap (nil until set)
 }
 
 func NewProgress() *Progress {
@@ -90,7 +91,27 @@ func (p *Progress) Add(field *atomic.Int64, n int64) { field.Add(n) }
 
 func (p *Progress) SetTotalHint(n int64) { p.totalHint.Store(n) }
 
+// limiterView is the minimal surface Progress needs from the limiter.
+type limiterView interface{ Limit() int }
+
+func (p *Progress) SetLimit(l limiterView) {
+	p.mu.Lock()
+	p.lim = l
+	p.mu.Unlock()
+}
+
 func (p *Progress) IncInFlight(d int64) { p.inFlight.Add(d) }
+
+// currentLimit reads the adaptive cap; 0 when not set.
+func (p *Progress) currentLimit() int {
+	p.mu.Lock()
+	l := p.lim
+	p.mu.Unlock()
+	if l == nil {
+		return 0
+	}
+	return l.Limit()
+}
 
 func (p *Progress) Start() {
 	go func() {
@@ -140,10 +161,10 @@ func (p *Progress) render(forceNL bool) {
 		done = up + boot
 	}
 
-	line := fmt.Sprintf("[%s] scanned=%s uploaded=%s verified=%s resumed-done=%s failed=%s inflight=%d retry=%s rate=%.0f obj/s %.1f MB/s",
+	line := fmt.Sprintf("[%s] scanned=%s uploaded=%s verified=%s resumed-done=%s failed=%s inflight=%d/%d retry=%s rate=%.0f obj/s %.1f MB/s",
 		elapsed,
 		comma(sc), comma(up), comma(vf), comma(boot), comma(fail),
-		inF, comma(p.retried.Load()), rate, bps/1024/1024)
+		inF, p.currentLimit(), comma(p.retried.Load()), rate, bps/1024/1024)
 	if total > 0 {
 		pct := float64(done) / float64(total) * 100
 		line += fmt.Sprintf(" progress=%.1f%% (%s/%s)", pct, comma(done), comma(total))

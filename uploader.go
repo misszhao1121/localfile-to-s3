@@ -59,6 +59,11 @@ func buildClient(cfg *Config) (*s3.Client, error) {
 			Transport: transport,
 			Timeout:   time.Duration(cfg.HTTPTimeoutSec) * time.Second,
 		}
+		// Keep SDK retries modest: the app layer owns the retry policy.
+		// 3 SDK attempts x app MaxRetries is enough; more just amplifies
+		// load against an already-throttling cluster (retry storm).
+		o.RetryMaxAttempts = 3
+		o.RetryMode = aws.RetryModeStandard
 	})
 	return client, nil
 }
@@ -315,6 +320,9 @@ func readAllInto(buf []byte, f *os.File, size int64) ([]byte, error) {
 
 // runUploaders drains pending/failed tasks with a worker pool.
 // Returns nil when the task queue is empty and all workers finished.
+// An AIMD limiter (adaptive.go) sits between the pool and the cluster:
+// on 503/SlowDown the in-flight cap halves, on success it ramps back,
+// preventing retry storms against a throttling cluster.
 func runUploaders(ctx context.Context, cfg *Config, st *Store, prog *Progress) error {
 	cli, err := buildClient(cfg)
 	if err != nil {
@@ -327,6 +335,9 @@ func runUploaders(ctx context.Context, cfg *Config, st *Store, prog *Progress) e
 			return &b
 		},
 	}
+
+	lim := newAdaptiveLimiter(cfg.Workers, 2)
+	prog.SetLimit(lim)
 
 	const batchSize = 512
 	var wg sync.WaitGroup
@@ -372,9 +383,15 @@ func runUploaders(ctx context.Context, cfg *Config, st *Store, prog *Progress) e
 		go func() {
 			defer wg.Done()
 			for t := range tasks {
+				// AIMD gate: park here while the cluster is throttling
+				if err := lim.Acquire(ctx); err != nil {
+					continue
+				}
 				prog.IncInFlight(1)
 				uploaded, skipped, err := uploadOne(ctx, cli, cfg, pool, prog, t)
 				prog.IncInFlight(-1)
+				ok := err == nil
+				lim.Release(ok)
 				switch {
 				case err != nil && errors.Is(err, context.Canceled):
 					// leave as pending
