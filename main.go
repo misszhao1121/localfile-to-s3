@@ -93,6 +93,8 @@ func run() error {
 			mode = ModeReset
 		case string(ModeWeb):
 			mode = ModeWeb
+		case string(ModeCount):
+			mode = ModeCount
 		default:
 			cfgPath = positional[0]
 		}
@@ -146,6 +148,8 @@ func run() error {
 	case ModeWeb:
 		st.Close() // web manages its own store per job
 		return runWeb(cfg, cfgPath)
+	case ModeCount:
+		return runCount(ctx, cfg, st)
 	}
 	return nil
 }
@@ -160,6 +164,7 @@ Usage:
 Modes:
   (default)          plan + upload
   web                web UI: config editor, start/stop, live progress (port 8080)
+  count              list bucket totals: objects, bytes, per-prefix (fast survey)
   verify             reconcile local state with HeadObject on the cluster
   retry              re-attempt failed keys
   stats              print counts

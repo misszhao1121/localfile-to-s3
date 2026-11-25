@@ -10,4 +10,5 @@ const (
 	ModeStats   Mode = "stats"
 	ModeReset   Mode = "reset"
 	ModeWeb     Mode = "web"
+	ModeCount   Mode = "count"
 )
