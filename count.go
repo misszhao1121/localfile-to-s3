@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -176,10 +177,13 @@ func listTopPrefixes(ctx context.Context, cli *s3.Client, bucket, prefix string)
 }
 
 // countRange pages all objects under a prefix, aggregating count/bytes and
-// per-first-level-prefix stats for that range.
+// per-first-level-prefix stats for that range. Progress prints every 10k
+// keys so long listings (39M keys => ~4w pages) don't look hung.
 func countRange(ctx context.Context, cli *s3.Client, bucket, prefix string) (prefixStat, error) {
 	var stat prefixStat
 	var token *string
+	pages := 0
+	last := time.Now()
 	for {
 		out, err := cli.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
 			Bucket:            aws.String(bucket),
@@ -195,6 +199,12 @@ func countRange(ctx context.Context, cli *s3.Client, bucket, prefix string) (pre
 			if o.Size != nil {
 				stat.bytes += *o.Size
 			}
+		}
+		pages++
+		if time.Since(last) >= 10*time.Second {
+			last = time.Now()
+			logf(os.Stdout, "  listing %s: %s objects so far (%d pages)...\n",
+				truncateKey(prefix, 40), comma(stat.count), pages)
 		}
 		if out.IsTruncated == nil || !*out.IsTruncated {
 			break
